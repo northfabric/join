@@ -54,7 +54,7 @@ try {
 
   # 2. The server, over a connection pinned to its certificate.
   $step = 'server'; Say 'Reaching the server'
-  Add-Type -TypeDefinition @"
+  if (-not ('Pin' -as [type])) { Add-Type -TypeDefinition @"
 using System; using System.Net; using System.Net.Security; using System.Security.Cryptography; using System.Security.Cryptography.X509Certificates;
 public static class Pin {
   static string fp;
@@ -63,7 +63,7 @@ public static class Pin {
     using (var a = SHA256.Create()) return BitConverter.ToString(a.ComputeHash(c.GetRawCertData())).Replace("-", "").ToLower() == fp;
   }
 }
-"@
+"@ }
   [Pin]::On($FP); $script:pinned = $true
   $reached = $false
   for ($i = 0; $i -lt 60 -and -not $reached; $i++) {
@@ -83,4 +83,7 @@ public static class Pin {
   Write-Host "FAILED at step '$step': $msg" -ForegroundColor Red
   Write-Host 'You can run the same command again until it expires: it resumes where it stopped.' -ForegroundColor Yellow
   throw
+} finally {
+  # The pin lasts for the whole PowerShell session: lift it, or the next download in this window (the join script itself, from github.io) fails.
+  if ($script:pinned) { [Net.ServicePointManager]::ServerCertificateValidationCallback = $null }
 }
