@@ -1,0 +1,86 @@
+# Mining Monitor: add this PC as a worker. Run in PowerShell AS ADMINISTRATOR, then type the join code shown on the dashboard.
+# Nothing secret is in this file. It installs Tailscale if the PC has none (or uses the one that is there, unchanged), reaches the server
+# over Tailscale with the server's certificate pinned, and runs the installer that the server hands out for your join code.
+$ErrorActionPreference = 'Stop'
+$S = 'https://100.71.159.41:9443'; $FP = '8492eb0516417214856a24381559f760727f453dda3b1088b1ec1b0d095180bd'
+$T = ((Read-Host 'Join code (on the dashboard, like ABCDE-FGHIJ)') -replace '[-\s]', '').ToUpper()
+if ($T -notmatch '^[A-HJ-NP-Z2-9]{10}$') { throw 'That is not a join code: ten letters and digits, like ABCDE-FGHIJ.' }
+$Setup = Join-Path $env:ProgramData 'mining-monitor-setup'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { throw 'Run this in an administrator PowerShell (right-click PowerShell, Run as administrator).' }
+if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'This command is for Windows on a 64-bit Intel/AMD processor (x64) only.' }
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+New-Item -ItemType Directory -Force -Path $Setup | Out-Null
+& icacls.exe $Setup /inheritance:r /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
+function Say($t) { Write-Host "==> $t" -ForegroundColor Cyan }
+$script:pinned = $false
+function Report($status, $step, $msg) {
+  if (-not $script:pinned) { return }
+  try {
+    $b = ConvertTo-Json @{ status = $status; step = $step; message = $msg } -Compress
+    return Invoke-RestMethod -Method Post -Uri "$S/api/enroll/progress" -Headers @{ Authorization = "Bearer $T" } -ContentType 'application/json' -Body $b
+  } catch { Write-Host "    (could not report progress: $($_.Exception.Message))" }
+}
+$step = 'start'; $script:enrolled = $false
+try {
+  # 1. Tailscale: use the one that is there, never change it (EN-5); install and join only if there is none.
+  $step = 'tailscale'; Say 'Tailscale'
+  $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+  $marker = Join-Path $Setup 'tailscale-installed-by-us'
+  if (-not (Test-Path -LiteralPath $ts)) {
+    $msi = Join-Path $Setup 'tailscale-setup.msi'
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+    $sig = Get-AuthenticodeSignature -LiteralPath $msi
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Tailscale Inc\.') { Remove-Item $msi -Force; throw 'The Tailscale installer is not signed by Tailscale Inc. Nothing was installed.' }
+    Write-Host '    installing Tailscale (signature checked)'
+    $p = Start-Process msiexec.exe -ArgumentList '/i', ('"' + $msi + '"'), '/quiet', '/norestart' -Wait -PassThru
+    if ($p.ExitCode -notin 0, 3010) { throw "The Tailscale installer failed (exit code $($p.ExitCode))." }
+    Remove-Item $msi -Force
+    Set-Content -LiteralPath $marker -Value 'installed by the Mining Monitor installer' -Encoding ASCII
+  }
+  function Get-TsState { try { return (& $ts status --json 2>$null | ConvertFrom-Json).BackendState } catch { return $null } }
+  $state = $null
+  for ($i = 0; $i -lt 30 -and -not $state; $i++) { $state = Get-TsState; if (-not $state) { Start-Sleep -Seconds 2 } }
+  if ($state -eq 'NeedsLogin') {
+    if (-not (Test-Path -LiteralPath $marker)) { throw 'Tailscale is installed but signed out. This command does not touch an existing Tailscale: sign in yourself, then run it again.' }
+    Write-Host '    Open the address Tailscale prints below in a browser and sign in with your account.' -ForegroundColor Yellow
+    & $ts up --unattended
+    $state = Get-TsState
+  }
+  if ($state -ne 'Running') { throw "Tailscale is not connected (state: $state). Connect it, then run this command again." }
+  $prefs = $null; try { $prefs = & $ts debug prefs 2>$null | ConvertFrom-Json } catch { }
+  if ($prefs -and -not $prefs.ForceDaemon) { Write-Warning 'Tailscale is not set to run unattended: after a reboot this PC reaches the server only once someone logs in. Windows tray menu > Preferences > Run unattended.' }
+
+  # 2. The server, over a connection pinned to its certificate.
+  $step = 'server'; Say 'Reaching the server'
+  Add-Type -TypeDefinition @"
+using System; using System.Net; using System.Net.Security; using System.Security.Cryptography; using System.Security.Cryptography.X509Certificates;
+public static class Pin {
+  static string fp;
+  public static void On(string f) { fp = f; ServicePointManager.ServerCertificateValidationCallback = Check; }
+  static bool Check(object s, X509Certificate c, X509Chain h, SslPolicyErrors e) {
+    using (var a = SHA256.Create()) return BitConverter.ToString(a.ComputeHash(c.GetRawCertData())).Replace("-", "").ToLower() == fp;
+  }
+}
+"@
+  [Pin]::On($FP); $script:pinned = $true
+  $reached = $false
+  for ($i = 0; $i -lt 60 -and -not $reached; $i++) {
+    try { Invoke-WebRequest -UseBasicParsing -Uri "$S/login" -TimeoutSec 8 | Out-Null; $reached = $true } catch { Start-Sleep -Seconds 5 }
+  }
+  if (-not $reached) { throw "The server $S does not answer. Is Tailscale connected, and does the tailnet policy let this PC reach it?" }
+  $null = Report 'connected' 'server reached' ''
+
+  # The installer for this join code, from the server (over Tailscale, certificate pinned, the code authenticates the request).
+  $step = 'installer'; Say 'Fetching the installer'
+  $installer = (Invoke-WebRequest -UseBasicParsing -Uri "$S/api/enroll/bootstrap" -Headers @{ Authorization = "Bearer $T" }).Content
+  Invoke-Expression $installer
+} catch {
+  $msg = $_.Exception.Message
+  # Before the ticket is used, the ticket must stay usable for a rerun: report the failure as a step of "connected", not as failed.
+  if ($script:enrolled) { $null = Report 'failed' $step $msg } else { $null = Report 'connected' ('failed: ' + $step) $msg }
+  Write-Host "FAILED at step '$step': $msg" -ForegroundColor Red
+  Write-Host 'You can run the same command again until it expires: it resumes where it stopped.' -ForegroundColor Yellow
+  throw
+}
